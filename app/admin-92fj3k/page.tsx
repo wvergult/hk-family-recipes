@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { supabase } from "../../lib/supabase"
 import Link from "next/link"
@@ -15,6 +15,8 @@ interface Ingredient {
   fat: number
 }
 
+const IMAGE_BUCKET = "recipe-images"
+
 export default function AdminPage() {
   const router = useRouter()
 
@@ -23,6 +25,11 @@ export default function AdminPage() {
   const [description, setDescription] = useState("")
   const [steps, setSteps] = useState("")
   const [status, setStatus] = useState("")
+
+  const [sourceUrl, setSourceUrl] = useState("")
+  const [imageUrl, setImageUrl] = useState("")
+  const [imageError, setImageError] = useState("")
+  const [imageUploading, setImageUploading] = useState(false)
 
   const [servings, setServings] = useState(4)
 
@@ -33,6 +40,81 @@ export default function AdminPage() {
     carbs: 0,
     fat: 0,
   })
+
+  const uploadImageFile = async (file: File) => {
+    setImageUploading(true)
+    setImageError("")
+    setStatus("Uploading pasted screenshot...")
+
+    try {
+      const fileExt = file.type.split("/")[1] || "png"
+      const fileName = `${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2)}.${fileExt}`
+      const filePath = `admin-uploads/${fileName}`
+
+      const { error: uploadError } = await supabase.storage
+        .from(IMAGE_BUCKET)
+        .upload(filePath, file, {
+          contentType: file.type,
+          upsert: false,
+        })
+
+      if (uploadError) {
+        setImageError("Image upload failed: " + uploadError.message)
+        setStatus("❌ Image upload failed.")
+        return
+      }
+
+      const { data } = supabase.storage
+        .from(IMAGE_BUCKET)
+        .getPublicUrl(filePath)
+
+      if (!data.publicUrl) {
+        setImageError("Could not get public image URL.")
+        setStatus("❌ Could not get public image URL.")
+        return
+      }
+
+      setImageUrl(data.publicUrl)
+      setStatus("✅ Screenshot uploaded!")
+    } catch {
+      setImageError("Something went wrong while uploading the screenshot.")
+      setStatus("❌ Screenshot upload failed.")
+    } finally {
+      setImageUploading(false)
+    }
+  }
+
+  useEffect(() => {
+    const handlePaste = async (event: ClipboardEvent) => {
+      const items = event.clipboardData?.items
+
+      if (!items) return
+
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith("image/")) {
+          event.preventDefault()
+
+          const file = item.getAsFile()
+
+          if (!file) {
+            setImageError("Could not read pasted image.")
+            return
+          }
+
+          await uploadImageFile(file)
+          return
+        }
+      }
+    }
+
+    window.addEventListener("paste", handlePaste)
+
+    return () => {
+      window.removeEventListener("paste", handlePaste)
+    }
+  }, [])
 
   const parseRecipe = async () => {
     setStatus("Parsing recipe...")
@@ -85,16 +167,20 @@ export default function AdminPage() {
   }
 
   const handleSubmit = async () => {
-    setStatus("Fetching image...")
+    let finalImageUrl = imageUrl.trim() || null
 
-    const imageRes = await fetch("/api/get-recipe-image", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title }),
-    })
+    if (!finalImageUrl) {
+      setStatus("Fetching fallback image...")
 
-    const imageData = await imageRes.json()
-    const imageUrl = imageData.imageUrl || null
+      const imageRes = await fetch("/api/get-recipe-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      })
+
+      const imageData = await imageRes.json()
+      finalImageUrl = imageData.imageUrl || null
+    }
 
     setStatus("Saving recipe...")
 
@@ -105,7 +191,8 @@ export default function AdminPage() {
           title,
           description,
           steps,
-          image_url: imageUrl,
+          image_url: finalImageUrl,
+          source_url: sourceUrl.trim() || null,
           base_servings: servings,
           total_calories: totals.calories,
           total_protein: totals.protein,
@@ -151,6 +238,22 @@ export default function AdminPage() {
 
     setStatus("✅ Recipe saved successfully!")
 
+    setRawText("")
+    setTitle("")
+    setDescription("")
+    setSteps("")
+    setSourceUrl("")
+    setImageUrl("")
+    setImageError("")
+    setIngredients([])
+    setTotals({
+      calories: 0,
+      protein: 0,
+      carbs: 0,
+      fat: 0,
+    })
+    setServings(4)
+
     router.push("/")
   }
 
@@ -171,15 +274,95 @@ export default function AdminPage() {
         </div>
 
         <div className="bg-white rounded-3xl p-8 shadow-sm space-y-6">
-          <textarea
-            className="w-full border border-neutral-200 rounded-xl p-4 h-40"
-            value={rawText}
-            onChange={(e) => setRawText(e.target.value)}
-          />
+          <div>
+            <label className="block text-sm font-medium mb-2">
+              Recipe text
+            </label>
+
+            <textarea
+              className="w-full border border-neutral-200 rounded-xl p-4 h-40"
+              value={rawText}
+              onChange={(e) => setRawText(e.target.value)}
+              placeholder="Paste the recipe text here..."
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2">
+              Original recipe URL
+            </label>
+
+            <input
+              type="url"
+              value={sourceUrl}
+              onChange={(e) => setSourceUrl(e.target.value)}
+              placeholder="https://www.instagram.com/reel/..."
+              className="w-full border border-neutral-200 rounded-xl p-4"
+            />
+
+            {sourceUrl && (
+              <a
+                href={sourceUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-block mt-2 text-sm text-blue-600 underline break-all"
+              >
+                Open source URL
+              </a>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium mb-2">
+              Image URL
+            </label>
+
+            <input
+              type="url"
+              value={imageUrl}
+              onChange={(e) => setImageUrl(e.target.value)}
+              placeholder="Paste image URL or paste a screenshot below"
+              className="w-full border border-neutral-200 rounded-xl p-4"
+            />
+
+            <div className="mt-3 rounded-2xl border border-dashed border-neutral-300 bg-neutral-50 p-5 text-sm text-neutral-500">
+              {imageUploading ? (
+                <span>Uploading pasted screenshot...</span>
+              ) : (
+                <span>
+                  Screenshot image: copy a screenshot, click anywhere on this
+                  page, then press <strong>Ctrl+V</strong> or{" "}
+                  <strong>Cmd+V</strong>.
+                </span>
+              )}
+            </div>
+
+            {imageError && (
+              <p className="text-sm text-red-600 mt-2">
+                {imageError}
+              </p>
+            )}
+
+            {imageUrl && (
+              <div className="mt-4">
+                <img
+                  src={imageUrl}
+                  alt="Recipe preview"
+                  className="w-full max-h-80 object-cover rounded-2xl border border-neutral-200"
+                />
+              </div>
+            )}
+
+            <p className="text-xs text-neutral-500 mt-2">
+              If this is blank, the app will use the Unsplash fallback image
+              when saving.
+            </p>
+          </div>
 
           <button
             onClick={parseRecipe}
-            className="bg-black text-white px-5 py-2 rounded-full text-sm hover:opacity-80 transition"
+            disabled={imageUploading}
+            className="bg-black text-white px-5 py-2 rounded-full text-sm hover:opacity-80 transition disabled:opacity-40"
           >
             Parse with AI
           </button>
@@ -190,6 +373,28 @@ export default function AdminPage() {
             <h2 className="text-xl font-medium">
               Ingredients
             </h2>
+
+            {title && (
+              <div>
+                <div className="text-sm text-neutral-500">
+                  Title
+                </div>
+                <div className="text-lg font-medium">
+                  {title}
+                </div>
+              </div>
+            )}
+
+            {description && (
+              <div>
+                <div className="text-sm text-neutral-500">
+                  Description
+                </div>
+                <p className="text-neutral-700">
+                  {description}
+                </p>
+              </div>
+            )}
 
             <div className="space-y-2 text-neutral-600">
               {ingredients.map((ing, i) => (
@@ -241,7 +446,7 @@ export default function AdminPage() {
 
         <button
           onClick={handleSubmit}
-          disabled={ingredients.length === 0}
+          disabled={ingredients.length === 0 || imageUploading}
           className="w-full bg-black text-white rounded-full py-3 text-sm hover:opacity-80 transition disabled:opacity-40"
         >
           Save Recipe

@@ -99,10 +99,7 @@ function convertToMetric(quantity: number, unit: string | null) {
     }
   }
 
-  if (
-    normalizedUnit === "cup" ||
-    normalizedUnit === "cups"
-  ) {
+  if (normalizedUnit === "cup" || normalizedUnit === "cups") {
     return {
       quantity: quantity * 240,
       unit: "ml",
@@ -156,6 +153,7 @@ export default function RecipePage() {
   const [title, setTitle] = useState("")
   const [description, setDescription] = useState("")
   const [steps, setSteps] = useState("")
+  const [sourceUrl, setSourceUrl] = useState<string | null>(null)
   const [ingredients, setIngredients] = useState<Ingredient[]>([])
   const [baseServings, setBaseServings] = useState(1)
 
@@ -169,7 +167,7 @@ export default function RecipePage() {
     const fetchData = async () => {
       const { data: recipe } = await supabase
         .from("recipes")
-        .select("title, description, base_servings, steps")
+        .select("title, description, base_servings, steps, source_url")
         .eq("id", recipeId)
         .single()
 
@@ -184,6 +182,7 @@ export default function RecipePage() {
         setTitle(recipe.title)
         setDescription(recipe.description)
         setSteps(recipe.steps || "")
+        setSourceUrl(recipe.source_url || null)
         setBaseServings(servings)
         setSelectedServings(servings)
         setTargetServings(servings)
@@ -257,9 +256,21 @@ export default function RecipePage() {
             <h1 className="text-4xl font-semibold tracking-tight">
               {title}
             </h1>
+
             <p className="text-neutral-500 text-lg leading-relaxed mt-4">
               {description}
             </p>
+
+            {sourceUrl && (
+              <a
+                href={sourceUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex mt-5 bg-black text-white rounded-full px-5 py-2 text-sm hover:opacity-80 transition"
+              >
+                Open Original Source
+              </a>
+            )}
           </div>
         </div>
 
@@ -276,9 +287,7 @@ export default function RecipePage() {
               min="1"
               max="10"
               value={targetServings}
-              onChange={(e) =>
-                setTargetServings(Number(e.target.value))
-              }
+              onChange={(e) => setTargetServings(Number(e.target.value))}
               className="w-full"
             />
 
@@ -396,9 +405,7 @@ export default function RecipePage() {
               min="1"
               max="10"
               value={selectedServings}
-              onChange={(e) =>
-                setSelectedServings(Number(e.target.value))
-              }
+              onChange={(e) => setSelectedServings(Number(e.target.value))}
               className="w-full"
             />
 
@@ -499,6 +506,28 @@ export default function RecipePage() {
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Original Source */}
+        {sourceUrl && (
+          <div className="bg-white rounded-3xl p-8 shadow-sm space-y-4">
+            <h2 className="text-2xl font-semibold">
+              Original Source
+            </h2>
+
+            <p className="text-sm text-neutral-500">
+              Revisit the original recipe or video here.
+            </p>
+
+            <a
+              href={sourceUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-block text-blue-600 underline break-all"
+            >
+              {sourceUrl}
+            </a>
           </div>
         )}
       </div>
