@@ -4,6 +4,7 @@ import { useEffect, useState } from "react"
 import { useParams } from "next/navigation"
 import { supabase } from "../../../lib/supabase"
 import Link from "next/link"
+import { ShoppingList } from "../../../components/ShoppingList"
 
 interface Ingredient {
   id: string
@@ -16,6 +17,16 @@ interface Ingredient {
   fat: number
 }
 
+interface ShoppingItem {
+  id: string
+  recipe_id: string
+  ingredient_id: string
+  needed: boolean
+  bought: boolean
+  created_at?: string
+  updated_at?: string
+}
+
 interface EditableIngredient {
   name: string
   quantity: string
@@ -24,12 +35,12 @@ interface EditableIngredient {
 
 interface RecalculatedIngredient {
   name: string
-  quantity: number
-  unit: string
-  calories: number
-  protein: number
-  carbs: number
-  fat: number
+  quantity: number | string | null
+  unit: string | null
+  calories: number | null
+  protein: number | null
+  carbs: number | null
+  fat: number | null
 }
 
 interface RecalculatedRecipe {
@@ -140,8 +151,8 @@ function convertToMetric(quantity: number, unit: string | null) {
     normalizedUnit === "tablespoons"
   ) {
     return {
-      quantity: quantity * 15,
-      unit: "ml",
+      quantity,
+      unit: "tbsp",
     }
   }
 
@@ -151,8 +162,8 @@ function convertToMetric(quantity: number, unit: string | null) {
     normalizedUnit === "teaspoons"
   ) {
     return {
-      quantity: quantity * 5,
-      unit: "ml",
+      quantity,
+      unit: "tsp",
     }
   }
 
@@ -184,6 +195,10 @@ export default function RecipePage() {
   const [sourceUrl, setSourceUrl] = useState<string | null>(null)
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [ingredients, setIngredients] = useState<Ingredient[]>([])
+  const [shoppingItems, setShoppingItems] = useState<ShoppingItem[]>([])
+  const [updatingShoppingItemNames, setUpdatingShoppingItemNames] = useState<
+  string[]
+>([])
   const [baseServings, setBaseServings] = useState(1)
 
   // This controls how many servings the saved recipe is divided into
@@ -206,14 +221,17 @@ export default function RecipePage() {
   const fetchData = async () => {
     const { data: recipe } = await supabase
       .from("recipes")
-      .select(
-        "title, description, base_servings, steps, source_url, image_url"
-      )
+      .select("title, description, base_servings, steps, source_url, image_url")
       .eq("id", recipeId)
       .single()
 
     const { data: ingredientData } = await supabase
       .from("ingredients")
+      .select("*")
+      .eq("recipe_id", recipeId)
+
+    const { data: shoppingItemData } = await supabase
+      .from("recipe_shopping_items")
       .select("*")
       .eq("recipe_id", recipeId)
 
@@ -232,6 +250,10 @@ export default function RecipePage() {
 
     if (ingredientData) {
       setIngredients(ingredientData)
+    }
+
+    if (shoppingItemData) {
+      setShoppingItems(shoppingItemData)
     }
   }
 
@@ -352,6 +374,123 @@ export default function RecipePage() {
     return data.publicUrl
   }
 
+const getShoppingItemForIngredient = (ingredientId: string) => {
+  return shoppingItems.find((item) => item.ingredient_id === ingredientId)
+}
+
+const isIngredientNeeded = (ingredientId: string) => {
+  const existingItem = getShoppingItemForIngredient(ingredientId)
+
+  return existingItem?.needed === true
+}
+
+const toggleIngredientShoppingItem = async (
+  ingredient: Ingredient,
+  checked: boolean
+) => {
+  const ingredientId = ingredient.id
+  const existingItem = getShoppingItemForIngredient(ingredientId)
+
+  if (updatingShoppingItemNames.includes(ingredientId)) return
+
+  setUpdatingShoppingItemNames((current) => [...current, ingredientId])
+  setStatusMessage("Updating shopping list...")
+
+  const tempId = `temp-${ingredientId}`
+
+  setShoppingItems((currentItems) => {
+    if (existingItem) {
+      return currentItems.map((item) =>
+        item.id === existingItem.id
+          ? {
+              ...item,
+              needed: checked,
+            }
+          : item
+      )
+    }
+
+    return [
+      ...currentItems,
+      {
+        id: tempId,
+        recipe_id: recipeId,
+        ingredient_id: ingredientId,
+        needed: checked,
+        bought: false,
+      },
+    ]
+  })
+
+  try {
+    if (existingItem) {
+      const { data, error } = await supabase
+        .from("recipe_shopping_items")
+        .update({
+          needed: checked,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("id", existingItem.id)
+        .select("*")
+        .single()
+
+      if (error) {
+        throw error
+      }
+
+      if (!data) {
+        throw new Error("Supabase update returned no data.")
+      }
+
+      setShoppingItems((currentItems) =>
+        currentItems.map((item) =>
+          item.id === existingItem.id ? data : item
+        )
+      )
+    } else {
+      const { data, error } = await supabase
+        .from("recipe_shopping_items")
+        .insert({
+          recipe_id: recipeId,
+          ingredient_id: ingredientId,
+          needed: checked,
+          bought: false,
+        })
+        .select("*")
+        .single()
+
+      if (error) {
+        throw error
+      }
+
+      if (!data) {
+        throw new Error("Supabase insert returned no data.")
+      }
+
+      setShoppingItems((currentItems) =>
+        currentItems.map((item) => (item.id === tempId ? data : item))
+      )
+    }
+
+    setStatusMessage(
+      checked ? "Added to shopping list." : "Removed from shopping list."
+    )
+  } catch (error) {
+    console.error("Shopping item toggle failed:", error)
+
+    await fetchData()
+
+    const message =
+      error instanceof Error ? error.message : JSON.stringify(error, null, 2)
+
+    setStatusMessage(`Shopping list error:\n${message}`)
+  } finally {
+    setUpdatingShoppingItemNames((current) =>
+      current.filter((id) => id !== ingredientId)
+    )
+  }
+}
+
   const saveChanges = async () => {
     setSaving(true)
     setStatusMessage("Saving changes and recalculating macros...")
@@ -383,9 +522,7 @@ export default function RecipePage() {
         body: JSON.stringify({
           recipeId,
           title,
-          description,
-          steps,
-          baseServings: editableBaseServings,
+          servings: editableBaseServings,
           ingredients: cleanedIngredients,
         }),
       })
@@ -397,8 +534,7 @@ export default function RecipePage() {
         )
       }
 
-      const recalculatedRecipe =
-        (await response.json()) as RecalculatedRecipe
+      const recalculatedRecipe = (await response.json()) as RecalculatedRecipe
 
       const { error: deleteError } = await supabase
         .from("ingredients")
@@ -409,16 +545,19 @@ export default function RecipePage() {
         throw new Error(deleteError.message)
       }
 
-      const ingredientsToInsert = recalculatedRecipe.ingredients.map((ing) => ({
-        recipe_id: recipeId,
-        name: ing.name,
-        quantity: ing.quantity,
-        unit: ing.unit,
-        calories: ing.calories,
-        protein: ing.protein,
-        carbs: ing.carbs,
-        fat: ing.fat,
-      }))
+      const ingredientsToInsert = recalculatedRecipe.ingredients.map(
+        (ing: RecalculatedIngredient) => ({
+          recipe_id: recipeId,
+          name: ing.name,
+          quantity: Number(ing.quantity) || 0,
+          unit: ing.unit || "",
+
+          calories: ing.calories || 0,
+          protein: ing.protein || 0,
+          carbs: ing.carbs || 0,
+          fat: ing.fat || 0,
+        })
+      )
 
       const { data: insertedIngredients, error: insertError } = await supabase
         .from("ingredients")
@@ -459,6 +598,8 @@ export default function RecipePage() {
       setImagePreviewUrl(null)
       setIsEditing(false)
       setStatusMessage("Recipe updated.")
+
+      await fetchData()
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Something went wrong."
@@ -469,7 +610,6 @@ export default function RecipePage() {
     }
   }
 
-  // Original saved recipe totals
   const originalTotalCalories = ingredients.reduce(
     (sum, ing) => sum + ing.calories,
     0
@@ -490,22 +630,18 @@ export default function RecipePage() {
     0
   )
 
-  // Ingredient scaling for making a smaller or larger batch
   const batchMultiplier = targetServings / baseServings
 
-  // Scaled total macros for the batch you are actually making
   const recipeTotalCalories = originalTotalCalories * batchMultiplier
   const recipeTotalProtein = originalTotalProtein * batchMultiplier
   const recipeTotalCarbs = originalTotalCarbs * batchMultiplier
   const recipeTotalFat = originalTotalFat * batchMultiplier
 
-  // Macro profile per serving based on the batch you are making
   const perServingCalories = recipeTotalCalories / targetServings
   const perServingProtein = recipeTotalProtein / targetServings
   const perServingCarbs = recipeTotalCarbs / targetServings
   const perServingFat = recipeTotalFat / targetServings
 
-  // Optional comparison if user wants to divide the batch differently
   const dividedServingCalories = recipeTotalCalories / selectedServings
   const dividedServingProtein = recipeTotalProtein / selectedServings
   const dividedServingCarbs = recipeTotalCarbs / selectedServings
@@ -522,7 +658,7 @@ export default function RecipePage() {
         {/* Top Image */}
         {(imageUrl || imagePreviewUrl || isEditing) && (
           <div className="bg-white rounded-3xl p-4 shadow-sm space-y-4">
-            {(imagePreviewUrl || imageUrl) ? (
+            {imagePreviewUrl || imageUrl ? (
               <img
                 src={imagePreviewUrl || imageUrl || ""}
                 alt={title}
@@ -560,7 +696,7 @@ export default function RecipePage() {
           <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
             <Link
               href="/"
-              className="text-sm text-neutral-500 hover:text-black transition"
+              className="inline-flex items-center justify-center rounded-full border border-neutral-300 bg-white px-6 py-3 text-base font-medium text-black shadow-sm transition hover:bg-neutral-100"
             >
               ← Back to Recipes
             </Link>
@@ -594,9 +730,7 @@ export default function RecipePage() {
           </div>
 
           <div>
-            <h1 className="text-4xl font-semibold tracking-tight">
-              {title}
-            </h1>
+            <h1 className="text-4xl font-semibold tracking-tight">{title}</h1>
 
             <p className="text-neutral-500 text-lg leading-relaxed mt-4">
               {description}
@@ -623,7 +757,6 @@ export default function RecipePage() {
 
         {/* Macro Section */}
         <div className="bg-white rounded-3xl p-8 shadow-sm space-y-10">
-          {/* Batch Size Slider */}
           <div>
             <label className="block text-sm text-neutral-500 mb-3">
               Make {targetServings} portion{targetServings === 1 ? "" : "s"}
@@ -644,7 +777,6 @@ export default function RecipePage() {
             </p>
           </div>
 
-          {/* Total Macros */}
           <div>
             <h2 className="text-sm text-neutral-500 mb-4">
               Total Macros for {targetServings} Portion
@@ -656,90 +788,70 @@ export default function RecipePage() {
                 <div className="text-2xl font-medium">
                   {recipeTotalCalories.toFixed(0)}
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Calories
-                </div>
+                <div className="text-sm text-neutral-500">Calories</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {recipeTotalProtein.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Protein
-                </div>
+                <div className="text-sm text-neutral-500">Protein</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {recipeTotalCarbs.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Carbs
-                </div>
+                <div className="text-sm text-neutral-500">Carbs</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {recipeTotalFat.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Fat
-                </div>
+                <div className="text-sm text-neutral-500">Fat</div>
               </div>
             </div>
           </div>
 
           <div className="border-t border-neutral-200" />
 
-          {/* Per Serving */}
           <div>
-            <h2 className="text-sm text-neutral-500 mb-4">
-              Per Portion
-            </h2>
+            <h2 className="text-sm text-neutral-500 mb-4">Per Portion</h2>
 
             <div className="grid grid-cols-2 md:grid-cols-4 gap-6 text-center">
               <div>
                 <div className="text-2xl font-medium">
                   {perServingCalories.toFixed(0)}
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Calories
-                </div>
+                <div className="text-sm text-neutral-500">Calories</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {perServingProtein.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Protein
-                </div>
+                <div className="text-sm text-neutral-500">Protein</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {perServingCarbs.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Carbs
-                </div>
+                <div className="text-sm text-neutral-500">Carbs</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {perServingFat.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Fat
-                </div>
+                <div className="text-sm text-neutral-500">Fat</div>
               </div>
             </div>
           </div>
 
           <div className="border-t border-neutral-200" />
 
-          {/* Divide Slider */}
           <div>
             <label className="block text-sm text-neutral-500 mb-3">
               Or divide this batch into {selectedServings} serving
@@ -762,7 +874,6 @@ export default function RecipePage() {
             </p>
           </div>
 
-          {/* Divided Serving Macros */}
           <div>
             <h2 className="text-sm text-neutral-500 mb-4">
               If Divided Into {selectedServings} Serving
@@ -774,36 +885,28 @@ export default function RecipePage() {
                 <div className="text-2xl font-medium">
                   {dividedServingCalories.toFixed(0)}
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Calories
-                </div>
+                <div className="text-sm text-neutral-500">Calories</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {dividedServingProtein.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Protein
-                </div>
+                <div className="text-sm text-neutral-500">Protein</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {dividedServingCarbs.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Carbs
-                </div>
+                <div className="text-sm text-neutral-500">Carbs</div>
               </div>
 
               <div>
                 <div className="text-2xl font-medium">
                   {dividedServingFat.toFixed(1)}g
                 </div>
-                <div className="text-sm text-neutral-500">
-                  Fat
-                </div>
+                <div className="text-sm text-neutral-500">Fat</div>
               </div>
             </div>
           </div>
@@ -813,13 +916,12 @@ export default function RecipePage() {
         <div className="bg-white rounded-3xl p-8 shadow-sm space-y-6">
           <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
             <div>
-              <h2 className="text-2xl font-semibold">
-                Ingredients
-              </h2>
+              <h2 className="text-2xl font-semibold">Ingredients</h2>
 
               {!isEditing ? (
                 <p className="text-sm text-neutral-500 mt-2">
-                  Adjusted for {targetServings} portion
+                  Tick ingredients to add them to your shopping list. Adjusted
+                  for {targetServings} portion
                   {targetServings === 1 ? "" : "s"}.
                 </p>
               ) : (
@@ -842,16 +944,41 @@ export default function RecipePage() {
 
           {!isEditing ? (
             <div className="space-y-3 text-neutral-700">
-              {ingredients.map((ing) => {
-                const scaledQuantity = ing.quantity * batchMultiplier
-                const metric = convertToMetric(scaledQuantity, ing.unit)
+            {ingredients.map((ing) => {
+              const scaledQuantity = ing.quantity * batchMultiplier
+              const metric = convertToMetric(scaledQuantity, ing.unit)
+              const checked = isIngredientNeeded(ing.id)
+              const isUpdating = updatingShoppingItemNames.includes(ing.id)
 
-                return (
-                  <div key={ing.id}>
-                    • {formatQuantity(metric.quantity)} {metric.unit} {ing.name}
-                  </div>
-                )
-              })}
+              return (
+                <div
+                  key={ing.id}
+                  className="flex items-center gap-3 rounded-2xl px-3 py-2 hover:bg-neutral-50 transition"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={isUpdating}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) =>
+                      toggleIngredientShoppingItem(ing, e.target.checked)
+                    }
+                    className="h-4 w-4 shrink-0 accent-black cursor-pointer disabled:cursor-wait disabled:opacity-50"
+                  />
+
+                  <span
+                    className="cursor-pointer select-none"
+                    onClick={() => {
+                      if (!isUpdating) {
+                        toggleIngredientShoppingItem(ing, !checked)
+                      }
+                    }}
+                  >
+                    {formatQuantity(metric.quantity)} {metric.unit} {ing.name}
+                  </span>
+                </div>
+              )
+            })}
             </div>
           ) : (
             <div className="space-y-5">
@@ -933,12 +1060,27 @@ export default function RecipePage() {
           )}
         </div>
 
+        {!isEditing && (
+          <ShoppingList
+            recipeId={recipeId}
+            ingredients={ingredients.map((ing) => {
+              const scaledQuantity = ing.quantity * batchMultiplier
+              const metric = convertToMetric(scaledQuantity, ing.unit)
+
+              return {
+                id: ing.id,
+                name: ing.name,
+                amount: metric.quantity,
+                unit: metric.unit || null,
+              }
+            })}
+            shoppingItems={shoppingItems}
+          />
+          )}
         {/* Preparation */}
         {stepList.length > 0 && (
           <div className="bg-white rounded-3xl p-8 shadow-sm space-y-6">
-            <h2 className="text-2xl font-semibold">
-              Preparation
-            </h2>
+            <h2 className="text-2xl font-semibold">Preparation</h2>
 
             <div className="space-y-4 text-neutral-700">
               {stepList.map((step, index) => (
@@ -956,9 +1098,7 @@ export default function RecipePage() {
         {/* Original Source */}
         {sourceUrl && (
           <div className="bg-white rounded-3xl p-8 shadow-sm space-y-4">
-            <h2 className="text-2xl font-semibold">
-              Original Source
-            </h2>
+            <h2 className="text-2xl font-semibold">Original Source</h2>
 
             <p className="text-sm text-neutral-500">
               Revisit the original recipe or video here.
