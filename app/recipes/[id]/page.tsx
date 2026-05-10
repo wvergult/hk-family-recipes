@@ -55,6 +55,17 @@ interface RecalculatedRecipe {
   fat_per_serving: number
 }
 
+interface SavedRecipeMacros {
+  total_calories: number | null
+  total_protein: number | null
+  total_carbs: number | null
+  total_fat: number | null
+  calories_per_serving: number | null
+  protein_per_serving: number | null
+  carbs_per_serving: number | null
+  fat_per_serving: number | null
+}
+
 function convertToMetric(quantity: number, unit: string | null) {
   const normalizedUnit = unit?.toLowerCase().trim() || ""
 
@@ -185,6 +196,24 @@ function formatQuantity(quantity: number) {
   return quantity.toFixed(2).replace(/\.00$/, "").replace(/0$/, "")
 }
 
+function roundCalories(value: number) {
+  return Math.round(value)
+}
+
+function roundMacro(value: number) {
+  return Number(value.toFixed(1))
+}
+
+function valuesAreClose(
+  currentValue: number | null | undefined,
+  nextValue: number,
+  tolerance = 0.05
+) {
+  if (currentValue === null || currentValue === undefined) return false
+
+  return Math.abs(Number(currentValue) - nextValue) <= tolerance
+}
+
 export default function RecipePage() {
   const params = useParams()
   const recipeId = params.id as string
@@ -197,9 +226,12 @@ export default function RecipePage() {
   const [ingredients, setIngredients] = useState<Ingredient[]>([])
   const [shoppingItems, setShoppingItems] = useState<ShoppingItem[]>([])
   const [updatingShoppingItemNames, setUpdatingShoppingItemNames] = useState<
-  string[]
->([])
+    string[]
+  >([])
   const [baseServings, setBaseServings] = useState(1)
+
+  const [savedRecipeMacros, setSavedRecipeMacros] =
+    useState<SavedRecipeMacros | null>(null)
 
   // This controls how many servings the saved recipe is divided into
   const [selectedServings, setSelectedServings] = useState(1)
@@ -221,7 +253,9 @@ export default function RecipePage() {
   const fetchData = async () => {
     const { data: recipe } = await supabase
       .from("recipes")
-      .select("title, description, base_servings, steps, source_url, image_url")
+      .select(
+        "title, description, base_servings, steps, source_url, image_url, total_calories, total_protein, total_carbs, total_fat, calories_per_serving, protein_per_serving, carbs_per_serving, fat_per_serving"
+      )
       .eq("id", recipeId)
       .single()
 
@@ -246,6 +280,17 @@ export default function RecipePage() {
       setBaseServings(servings)
       setSelectedServings(servings)
       setTargetServings(servings)
+
+      setSavedRecipeMacros({
+        total_calories: recipe.total_calories,
+        total_protein: recipe.total_protein,
+        total_carbs: recipe.total_carbs,
+        total_fat: recipe.total_fat,
+        calories_per_serving: recipe.calories_per_serving,
+        protein_per_serving: recipe.protein_per_serving,
+        carbs_per_serving: recipe.carbs_per_serving,
+        fat_per_serving: recipe.fat_per_serving,
+      })
     }
 
     if (ingredientData) {
@@ -374,122 +419,122 @@ export default function RecipePage() {
     return data.publicUrl
   }
 
-const getShoppingItemForIngredient = (ingredientId: string) => {
-  return shoppingItems.find((item) => item.ingredient_id === ingredientId)
-}
+  const getShoppingItemForIngredient = (ingredientId: string) => {
+    return shoppingItems.find((item) => item.ingredient_id === ingredientId)
+  }
 
-const isIngredientNeeded = (ingredientId: string) => {
-  const existingItem = getShoppingItemForIngredient(ingredientId)
+  const isIngredientNeeded = (ingredientId: string) => {
+    const existingItem = getShoppingItemForIngredient(ingredientId)
 
-  return existingItem?.needed === true
-}
+    return existingItem?.needed === true
+  }
 
-const toggleIngredientShoppingItem = async (
-  ingredient: Ingredient,
-  checked: boolean
-) => {
-  const ingredientId = ingredient.id
-  const existingItem = getShoppingItemForIngredient(ingredientId)
+  const toggleIngredientShoppingItem = async (
+    ingredient: Ingredient,
+    checked: boolean
+  ) => {
+    const ingredientId = ingredient.id
+    const existingItem = getShoppingItemForIngredient(ingredientId)
 
-  if (updatingShoppingItemNames.includes(ingredientId)) return
+    if (updatingShoppingItemNames.includes(ingredientId)) return
 
-  setUpdatingShoppingItemNames((current) => [...current, ingredientId])
-  setStatusMessage("Updating shopping list...")
+    setUpdatingShoppingItemNames((current) => [...current, ingredientId])
+    setStatusMessage("Updating shopping list...")
 
-  const tempId = `temp-${ingredientId}`
+    const tempId = `temp-${ingredientId}`
 
-  setShoppingItems((currentItems) => {
-    if (existingItem) {
-      return currentItems.map((item) =>
-        item.id === existingItem.id
-          ? {
-              ...item,
-              needed: checked,
-            }
-          : item
-      )
-    }
-
-    return [
-      ...currentItems,
-      {
-        id: tempId,
-        recipe_id: recipeId,
-        ingredient_id: ingredientId,
-        needed: checked,
-        bought: false,
-      },
-    ]
-  })
-
-  try {
-    if (existingItem) {
-      const { data, error } = await supabase
-        .from("recipe_shopping_items")
-        .update({
-          needed: checked,
-          updated_at: new Date().toISOString(),
-        })
-        .eq("id", existingItem.id)
-        .select("*")
-        .single()
-
-      if (error) {
-        throw error
-      }
-
-      if (!data) {
-        throw new Error("Supabase update returned no data.")
-      }
-
-      setShoppingItems((currentItems) =>
-        currentItems.map((item) =>
-          item.id === existingItem.id ? data : item
+    setShoppingItems((currentItems) => {
+      if (existingItem) {
+        return currentItems.map((item) =>
+          item.id === existingItem.id
+            ? {
+                ...item,
+                needed: checked,
+              }
+            : item
         )
-      )
-    } else {
-      const { data, error } = await supabase
-        .from("recipe_shopping_items")
-        .insert({
+      }
+
+      return [
+        ...currentItems,
+        {
+          id: tempId,
           recipe_id: recipeId,
           ingredient_id: ingredientId,
           needed: checked,
           bought: false,
-        })
-        .select("*")
-        .single()
+        },
+      ]
+    })
 
-      if (error) {
-        throw error
+    try {
+      if (existingItem) {
+        const { data, error } = await supabase
+          .from("recipe_shopping_items")
+          .update({
+            needed: checked,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", existingItem.id)
+          .select("*")
+          .single()
+
+        if (error) {
+          throw error
+        }
+
+        if (!data) {
+          throw new Error("Supabase update returned no data.")
+        }
+
+        setShoppingItems((currentItems) =>
+          currentItems.map((item) =>
+            item.id === existingItem.id ? data : item
+          )
+        )
+      } else {
+        const { data, error } = await supabase
+          .from("recipe_shopping_items")
+          .insert({
+            recipe_id: recipeId,
+            ingredient_id: ingredientId,
+            needed: checked,
+            bought: false,
+          })
+          .select("*")
+          .single()
+
+        if (error) {
+          throw error
+        }
+
+        if (!data) {
+          throw new Error("Supabase insert returned no data.")
+        }
+
+        setShoppingItems((currentItems) =>
+          currentItems.map((item) => (item.id === tempId ? data : item))
+        )
       }
 
-      if (!data) {
-        throw new Error("Supabase insert returned no data.")
-      }
+      setStatusMessage(
+        checked ? "Added to shopping list." : "Removed from shopping list."
+      )
+    } catch (error) {
+      console.error("Shopping item toggle failed:", error)
 
-      setShoppingItems((currentItems) =>
-        currentItems.map((item) => (item.id === tempId ? data : item))
+      await fetchData()
+
+      const message =
+        error instanceof Error ? error.message : JSON.stringify(error, null, 2)
+
+      setStatusMessage(`Shopping list error:\n${message}`)
+    } finally {
+      setUpdatingShoppingItemNames((current) =>
+        current.filter((id) => id !== ingredientId)
       )
     }
-
-    setStatusMessage(
-      checked ? "Added to shopping list." : "Removed from shopping list."
-    )
-  } catch (error) {
-    console.error("Shopping item toggle failed:", error)
-
-    await fetchData()
-
-    const message =
-      error instanceof Error ? error.message : JSON.stringify(error, null, 2)
-
-    setStatusMessage(`Shopping list error:\n${message}`)
-  } finally {
-    setUpdatingShoppingItemNames((current) =>
-      current.filter((id) => id !== ingredientId)
-    )
   }
-}
 
   const saveChanges = async () => {
     setSaving(true)
@@ -551,7 +596,6 @@ const toggleIngredientShoppingItem = async (
           name: ing.name,
           quantity: Number(ing.quantity) || 0,
           unit: ing.unit || "",
-
           calories: ing.calories || 0,
           protein: ing.protein || 0,
           carbs: ing.carbs || 0,
@@ -568,19 +612,23 @@ const toggleIngredientShoppingItem = async (
         throw new Error(insertError.message)
       }
 
+      const nextSavedRecipeMacros = {
+        total_calories: recalculatedRecipe.total_calories,
+        total_protein: recalculatedRecipe.total_protein,
+        total_carbs: recalculatedRecipe.total_carbs,
+        total_fat: recalculatedRecipe.total_fat,
+        calories_per_serving: recalculatedRecipe.calories_per_serving,
+        protein_per_serving: recalculatedRecipe.protein_per_serving,
+        carbs_per_serving: recalculatedRecipe.carbs_per_serving,
+        fat_per_serving: recalculatedRecipe.fat_per_serving,
+      }
+
       const { error: recipeUpdateError } = await supabase
         .from("recipes")
         .update({
           image_url: updatedImageUrl,
           base_servings: editableBaseServings,
-          total_calories: recalculatedRecipe.total_calories,
-          total_protein: recalculatedRecipe.total_protein,
-          total_carbs: recalculatedRecipe.total_carbs,
-          total_fat: recalculatedRecipe.total_fat,
-          calories_per_serving: recalculatedRecipe.calories_per_serving,
-          protein_per_serving: recalculatedRecipe.protein_per_serving,
-          carbs_per_serving: recalculatedRecipe.carbs_per_serving,
-          fat_per_serving: recalculatedRecipe.fat_per_serving,
+          ...nextSavedRecipeMacros,
         })
         .eq("id", recipeId)
 
@@ -592,6 +640,7 @@ const toggleIngredientShoppingItem = async (
       setBaseServings(editableBaseServings)
       setSelectedServings(editableBaseServings)
       setTargetServings(editableBaseServings)
+      setSavedRecipeMacros(nextSavedRecipeMacros)
       setIngredients(insertedIngredients || [])
       setEditableIngredients([])
       setNewImageFile(null)
@@ -629,6 +678,91 @@ const toggleIngredientShoppingItem = async (
     (sum, ing) => sum + ing.fat,
     0
   )
+
+  const syncedCaloriesPerServing = roundCalories(
+    originalTotalCalories / baseServings
+  )
+  const syncedProteinPerServing = roundMacro(originalTotalProtein / baseServings)
+  const syncedCarbsPerServing = roundMacro(originalTotalCarbs / baseServings)
+  const syncedFatPerServing = roundMacro(originalTotalFat / baseServings)
+
+  const syncedTotalCalories = roundCalories(originalTotalCalories)
+  const syncedTotalProtein = roundMacro(originalTotalProtein)
+  const syncedTotalCarbs = roundMacro(originalTotalCarbs)
+  const syncedTotalFat = roundMacro(originalTotalFat)
+
+  useEffect(() => {
+    const syncRecipeCardMacros = async () => {
+      if (!recipeId || !savedRecipeMacros || ingredients.length === 0) return
+      if (!baseServings || baseServings < 1) return
+      if (isEditing || saving) return
+
+      const nextMacros = {
+        total_calories: syncedTotalCalories,
+        total_protein: syncedTotalProtein,
+        total_carbs: syncedTotalCarbs,
+        total_fat: syncedTotalFat,
+        calories_per_serving: syncedCaloriesPerServing,
+        protein_per_serving: syncedProteinPerServing,
+        carbs_per_serving: syncedCarbsPerServing,
+        fat_per_serving: syncedFatPerServing,
+      }
+
+      const alreadySynced =
+        valuesAreClose(savedRecipeMacros.total_calories, nextMacros.total_calories) &&
+        valuesAreClose(savedRecipeMacros.total_protein, nextMacros.total_protein) &&
+        valuesAreClose(savedRecipeMacros.total_carbs, nextMacros.total_carbs) &&
+        valuesAreClose(savedRecipeMacros.total_fat, nextMacros.total_fat) &&
+        valuesAreClose(
+          savedRecipeMacros.calories_per_serving,
+          nextMacros.calories_per_serving
+        ) &&
+        valuesAreClose(
+          savedRecipeMacros.protein_per_serving,
+          nextMacros.protein_per_serving
+        ) &&
+        valuesAreClose(
+          savedRecipeMacros.carbs_per_serving,
+          nextMacros.carbs_per_serving
+        ) &&
+        valuesAreClose(
+          savedRecipeMacros.fat_per_serving,
+          nextMacros.fat_per_serving
+        )
+
+      if (alreadySynced) return
+
+      const { error } = await supabase
+        .from("recipes")
+        .update(nextMacros)
+        .eq("id", recipeId)
+
+      if (error) {
+        console.error("Failed to sync recipe card macros:", error)
+        return
+      }
+
+      setSavedRecipeMacros(nextMacros)
+      console.log("Recipe card macros synced:", nextMacros)
+    }
+
+    syncRecipeCardMacros()
+  }, [
+    recipeId,
+    savedRecipeMacros,
+    ingredients.length,
+    baseServings,
+    isEditing,
+    saving,
+    syncedTotalCalories,
+    syncedTotalProtein,
+    syncedTotalCarbs,
+    syncedTotalFat,
+    syncedCaloriesPerServing,
+    syncedProteinPerServing,
+    syncedCarbsPerServing,
+    syncedFatPerServing,
+  ])
 
   const batchMultiplier = targetServings / baseServings
 
@@ -944,41 +1078,42 @@ const toggleIngredientShoppingItem = async (
 
           {!isEditing ? (
             <div className="space-y-3 text-neutral-700">
-            {ingredients.map((ing) => {
-              const scaledQuantity = ing.quantity * batchMultiplier
-              const metric = convertToMetric(scaledQuantity, ing.unit)
-              const checked = isIngredientNeeded(ing.id)
-              const isUpdating = updatingShoppingItemNames.includes(ing.id)
+              {ingredients.map((ing) => {
+                const scaledQuantity = ing.quantity * batchMultiplier
+                const metric = convertToMetric(scaledQuantity, ing.unit)
+                const checked = isIngredientNeeded(ing.id)
+                const isUpdating = updatingShoppingItemNames.includes(ing.id)
 
-              return (
-                <div
-                  key={ing.id}
-                  className="flex items-center gap-3 rounded-2xl px-3 py-2 hover:bg-neutral-50 transition"
-                >
-                  <input
-                    type="checkbox"
-                    checked={checked}
-                    disabled={isUpdating}
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) =>
-                      toggleIngredientShoppingItem(ing, e.target.checked)
-                    }
-                    className="h-4 w-4 shrink-0 accent-black cursor-pointer disabled:cursor-wait disabled:opacity-50"
-                  />
-
-                  <span
-                    className="cursor-pointer select-none"
-                    onClick={() => {
-                      if (!isUpdating) {
-                        toggleIngredientShoppingItem(ing, !checked)
-                      }
-                    }}
+                return (
+                  <div
+                    key={ing.id}
+                    className="flex items-center gap-3 rounded-2xl px-3 py-2 hover:bg-neutral-50 transition"
                   >
-                    {formatQuantity(metric.quantity)} {metric.unit} {ing.name}
-                  </span>
-                </div>
-              )
-            })}
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={isUpdating}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) =>
+                        toggleIngredientShoppingItem(ing, e.target.checked)
+                      }
+                      className="h-4 w-4 shrink-0 accent-black cursor-pointer disabled:cursor-wait disabled:opacity-50"
+                    />
+
+                    <span
+                      className="cursor-pointer select-none"
+                      onClick={() => {
+                        if (!isUpdating) {
+                          toggleIngredientShoppingItem(ing, !checked)
+                        }
+                      }}
+                    >
+                      {formatQuantity(metric.quantity)} {metric.unit}{" "}
+                      {ing.name}
+                    </span>
+                  </div>
+                )
+              })}
             </div>
           ) : (
             <div className="space-y-5">
@@ -1076,7 +1211,8 @@ const toggleIngredientShoppingItem = async (
             })}
             shoppingItems={shoppingItems}
           />
-          )}
+        )}
+
         {/* Preparation */}
         {stepList.length > 0 && (
           <div className="bg-white rounded-3xl p-8 shadow-sm space-y-6">
