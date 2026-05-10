@@ -1,12 +1,14 @@
 import { NextResponse } from "next/server"
-import { calculateMacros } from "../../../lib/nutrition/calculateMacros"
+import { calculateMacros } from "@/lib/nutrition/calculateMacros"
+import {
+  calculateMacroTotals,
+  calculatePerServing,
+} from "@/lib/nutrition/macroTotals"
 
-function roundCalories(value: number) {
-  return Math.round(value)
-}
-
-function roundMacro(value: number) {
-  return Math.round(value * 10) / 10
+interface IncomingIngredient {
+  name: string
+  quantity: number | string | null
+  unit: string | null
 }
 
 export async function POST(req: Request) {
@@ -33,13 +35,13 @@ export async function POST(req: Request) {
       )
     }
 
-    const cleanedIngredients = ingredients
+    const cleanedIngredients: IncomingIngredient[] = ingredients
       .map((ingredient: any) => ({
         name: String(ingredient.name || "").trim(),
         quantity: ingredient.quantity,
         unit: String(ingredient.unit || "").trim(),
       }))
-      .filter((ingredient: any) => ingredient.name)
+      .filter((ingredient: IncomingIngredient) => ingredient.name)
 
     if (cleanedIngredients.length === 0) {
       return NextResponse.json(
@@ -50,25 +52,25 @@ export async function POST(req: Request) {
 
     const result = await calculateMacros(cleanedIngredients)
 
-    const totalCalories = result.totals.calories
-    const totalProtein = result.totals.protein
-    const totalCarbs = result.totals.carbs
-    const totalFat = result.totals.fat
+    const totals = calculateMacroTotals(result.ingredients)
+    const perServing = calculatePerServing(totals, servings)
 
     return NextResponse.json({
       ingredients: result.ingredients,
 
-      total_calories: totalCalories,
-      total_protein: totalProtein,
-      total_carbs: totalCarbs,
-      total_fat: totalFat,
+      total_calories: totals.calories,
+      total_protein: totals.protein,
+      total_carbs: totals.carbs,
+      total_fat: totals.fat,
 
-      calories_per_serving: roundCalories(totalCalories / servings),
-      protein_per_serving: roundMacro(totalProtein / servings),
-      carbs_per_serving: roundMacro(totalCarbs / servings),
-      fat_per_serving: roundMacro(totalFat / servings),
+      calories_per_serving: perServing.calories,
+      protein_per_serving: perServing.protein,
+      carbs_per_serving: perServing.carbs,
+      fat_per_serving: perServing.fat,
     })
   } catch (error: any) {
+    console.error("Recalculate recipe error:", error)
+
     return NextResponse.json(
       {
         error: error.message || "Failed to recalculate recipe.",

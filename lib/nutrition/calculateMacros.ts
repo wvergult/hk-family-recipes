@@ -26,9 +26,22 @@ export type NormalizationStatus =
 export type NutritionStatus =
   | "manual_override"
   | "cached"
-  | "matched"
+  | "ai_estimated"
   | "unmatched"
   | "not_calculated"
+
+export type MacroCategory =
+  | "primary_food"
+  | "vegetable"
+  | "fruit"
+  | "herb_or_spice"
+  | "seasoning"
+  | "zero_calorie_liquid"
+  | "caloric_liquid"
+  | "stock_or_broth"
+  | "condiment"
+  | "leavening_or_additive"
+  | "unknown"
 
 export type CalculatedIngredient = {
   name: string
@@ -51,6 +64,10 @@ export type CalculatedIngredient = {
   normalization_status: NormalizationStatus
   nutrition_status: NutritionStatus
 
+  /**
+   * Legacy compatibility fields.
+   * These are no longer USDA-backed in the current implementation.
+   */
   fdc_id: number | null
   usda_description: string | null
 }
@@ -60,11 +77,49 @@ type GramResult = {
   normalization_status: NormalizationStatus
 }
 
+type AiMacroEstimate = MacroSet & {
+  macroRelevant: boolean
+  category: MacroCategory
+  confidence: "high" | "medium" | "low"
+  notes: string
+}
+
 const ZERO_MACROS: MacroSet = {
   calories: 0,
   protein: 0,
   carbs: 0,
   fat: 0,
+}
+
+function cleanName(name: string) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[£$€]\s?\d+(\.\d+)?/g, "")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(
+      /\bboneless\b|\bskinless\b|\bfresh\b|\bgrated\b|\bminced\b|\bthinly\b|\bsliced\b|\bfinely\b|\bchopped\b|\bdiced\b/g,
+      ""
+    )
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function isZeroCalorieWaterIngredient(name: string) {
+  const cleaned = cleanName(name)
+
+  return [
+    "water",
+    "plain water",
+    "tap water",
+    "filtered water",
+    "cold water",
+    "hot water",
+    "warm water",
+    "boiling water",
+    "boiled water",
+    "ice",
+    "ice water",
+  ].includes(cleaned)
 }
 
 /**
@@ -86,13 +141,26 @@ const NEGLIGIBLE_WHEN_AMOUNT_MISSING = new Set([
   "cayenne pepper",
   "avocado oil spray",
   "cooking spray",
+
+  "water",
+  "plain water",
+  "tap water",
+  "filtered water",
+  "cold water",
+  "hot water",
+  "warm water",
+  "boiling water",
+  "boiled water",
+  "ice",
+  "ice water",
 ])
 
 /**
- * Manual overrides for common ingredients where USDA often gives
- * a poor practical recipe match.
+ * Manual overrides for special app-specific ingredients.
  *
  * Values are per 100g.
+ *
+ * General nutrition lookup uses DeepSeek through OpenRouter.
  */
 const MANUAL_MACROS_PER_100G: Record<string, MacroSet> = {
   "chicken breast raw": {
@@ -129,7 +197,7 @@ const MANUAL_MACROS_PER_100G: Record<string, MacroSet> = {
     carbs: 3.6,
     fat: 0.1,
   },
-  
+
   "cooked chicken": {
     calories: 165,
     protein: 31,
@@ -467,6 +535,16 @@ const NAME_OVERRIDES: Record<string, string> = {
   paprika: "paprika",
 
   water: "water",
+  "plain water": "water",
+  "tap water": "water",
+  "filtered water": "water",
+  "cold water": "water",
+  "hot water": "water",
+  "warm water": "water",
+  "boiling water": "water",
+  "boiled water": "water",
+  ice: "water",
+  "ice water": "water",
 }
 
 const MASS_UNITS: Record<string, number> = {
@@ -553,7 +631,7 @@ const DENSITY_G_PER_ML: Record<string, number> = {
 const PIECE_WEIGHTS_G: Record<string, number> = {
   egg: 50,
 
-onion: 150,
+  onion: 150,
   onions: 150,
   "red onion": 150,
 
@@ -563,7 +641,7 @@ onion: 150,
   garlic: 3,
   "garlic clove": 3,
 
-avocado: 150,
+  avocado: 150,
   "avocado:pc": 150,
   "avocado:pcs": 150,
   "avocado:piece": 150,
@@ -623,19 +701,6 @@ avocado: 150,
   "tomatoes canned:tins": 400,
   "tomatoes canned:can": 400,
   "tomatoes canned:cans": 400,
-}
-
-function cleanName(name: string) {
-  return String(name || "")
-    .toLowerCase()
-    .replace(/[£$€]\s?\d+(\.\d+)?/g, "")
-    .replace(/\([^)]*\)/g, " ")
-    .replace(
-      /\bboneless\b|\bskinless\b|\bfresh\b|\bgrated\b|\bminced\b|\bthinly\b|\bsliced\b|\bfinely\b|\bchopped\b|\bdiced\b/g,
-      ""
-    )
-    .replace(/\s+/g, " ")
-    .trim()
 }
 
 function normalizeName(name: string) {
@@ -824,7 +889,7 @@ function convertToGrams(
       "box",
       "boxes",
       "serving",
-    "servings",
+      "servings",
     ].includes(u)
   ) {
     const pieceResult = findPieceWeight(name, u)
@@ -848,142 +913,311 @@ function convertToGrams(
   }
 }
 
-function getCaloriesFromFood(food: any) {
-  const nutrients = food.foodNutrients || []
-
-  const energy = nutrients.find(
-    (n: any) =>
-      String(n.nutrientName || "").toLowerCase() === "energy" &&
-      String(n.unitName || "").toUpperCase() === "KCAL"
-  )
-
-  return Number(energy?.value || 0)
-}
-
-function scoreFood(food: any, query: string) {
-  const description = String(food.description || "").toLowerCase()
-  const q = query.toLowerCase()
-
-  let score = 0
-
-  if (description === q) score += 100
-  if (description.includes(q)) score += 50
-
-  const queryWords = q.split(/\s+/).filter(Boolean)
-
-  for (const word of queryWords) {
-    if (description.includes(word)) {
-      score += 10
-    }
-  }
-
-  if (food.dataType === "Foundation") score += 10
-  if (food.dataType === "SR Legacy") score += 8
-
-  if (String(food.servingSizeUnit || "").toLowerCase() === "g") {
-    score += 3
-  }
-
-  return score
-}
-
-async function lookupUSDA(query: string) {
-  if (!process.env.USDA_API_KEY) {
-    throw new Error("Missing USDA_API_KEY environment variable.")
-  }
-
-  const res = await fetch(
-    `https://api.nal.usda.gov/fdc/v1/foods/search?api_key=${process.env.USDA_API_KEY}`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        query,
-        pageSize: 10,
-        dataType: ["Foundation", "SR Legacy"],
-      }),
-    }
-  )
-
-  if (!res.ok) {
-    throw new Error(`USDA request failed: ${res.status}`)
-  }
-
-  const data = await res.json()
-
-  if (!data.foods || data.foods.length === 0) {
-    return null
-  }
-
-  const filtered = data.foods.filter((food: any) => {
-    const calories = getCaloriesFromFood(food)
-
-    if (
-      !calories &&
-      !query.includes("water") &&
-      !query.includes("salt") &&
-      !query.includes("pepper") &&
-      !query.includes("oregano") &&
-      !query.includes("thyme")
-    ) {
-      return false
-    }
-
-    if (calories > 900) return false
-    if (query.includes("water") && calories > 5) return false
-    if (query.includes("salt") && calories > 5) return false
-
-    return true
-  })
-
-  const candidates = filtered.length > 0 ? filtered : data.foods
-
-  candidates.sort((a: any, b: any) => {
-    return scoreFood(b, query) - scoreFood(a, query)
-  })
-
-  return candidates[0] || null
-}
-
-function extractMacrosPer100g(food: any): MacroSet {
-  const nutrients = food?.foodNutrients || []
-
-  const getNutrient = (names: string[], unitName?: string) => {
-    const nutrient = nutrients.find((n: any) => {
-      const nutrientName = String(n.nutrientName || "").toLowerCase()
-
-      const wanted = names.some(
-        (name) => nutrientName === name.toLowerCase()
-      )
-
-      if (!wanted) return false
-
-      if (unitName) {
-        return String(n.unitName || "").toUpperCase() === unitName.toUpperCase()
-      }
-
-      return true
-    })
-
-    return Number(nutrient?.value || 0)
-  }
-
-  return {
-    calories: getNutrient(["Energy"], "KCAL"),
-    protein: getNutrient(["Protein"], "G"),
-    fat: getNutrient(["Total lipid (fat)", "Total fat"], "G"),
-    carbs: getNutrient(["Carbohydrate, by difference"], "G"),
-  }
-}
-
 function roundCalories(value: number) {
   return Math.round(value)
 }
 
 function roundMacro(value: number) {
   return Math.round(value * 10) / 10
+}
+
+function extractJsonObject(text: string) {
+  const trimmed = text.trim()
+
+  try {
+    return JSON.parse(trimmed)
+  } catch {
+    const match = trimmed.match(/\{[\s\S]*\}/)
+
+    if (!match) {
+      throw new Error("No JSON object found in AI response.")
+    }
+
+    return JSON.parse(match[0])
+  }
+}
+
+function isValidMacroSet(macros: MacroSet) {
+  if (
+    !Number.isFinite(macros.calories) ||
+    !Number.isFinite(macros.protein) ||
+    !Number.isFinite(macros.carbs) ||
+    !Number.isFinite(macros.fat)
+  ) {
+    return false
+  }
+
+  if (
+    macros.calories < 0 ||
+    macros.protein < 0 ||
+    macros.carbs < 0 ||
+    macros.fat < 0 ||
+    macros.calories > 950 ||
+    macros.protein > 100 ||
+    macros.carbs > 100 ||
+    macros.fat > 100
+  ) {
+    return false
+  }
+
+  const macroCalories = macros.protein * 4 + macros.carbs * 4 + macros.fat * 9
+  const calorieDifference = Math.abs(macros.calories - macroCalories)
+
+  if (
+    macros.calories > 50 &&
+    macroCalories > 0 &&
+    calorieDifference > Math.max(120, macros.calories * 0.45)
+  ) {
+    return false
+  }
+
+  return true
+}
+
+async function estimateMacrosWithAI(
+  ingredientName: string
+): Promise<AiMacroEstimate | null> {
+  if (isZeroCalorieWaterIngredient(ingredientName) || normalizeName(ingredientName) === "water") {
+    return {
+      macroRelevant: false,
+      category: "zero_calorie_liquid",
+      calories: 0,
+      protein: 0,
+      carbs: 0,
+      fat: 0,
+      confidence: "high",
+      notes: "Hardcoded water safety override before AI.",
+    }
+  }
+
+  if (!process.env.OPENROUTER_API_KEY) {
+    console.error("Missing OPENROUTER_API_KEY environment variable.")
+    return null
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000",
+      "X-Title": "Recipe Macro Calculator",
+    },
+    body: JSON.stringify({
+      model: "deepseek/deepseek-chat-v3",
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content: `
+You are a strict nutrition classification and macro estimation engine.
+
+Return only valid JSON.
+No markdown.
+No commentary.
+No text outside JSON.
+
+You estimate typical nutrition values per 100 grams for recipe ingredients.
+
+You must follow this internal process before returning JSON:
+
+STAGE 1 — Identify the ingredient:
+- Determine whether the input is a real calorie-containing food, a drink/liquid, a seasoning, a herb/spice, a zero-calorie cooking liquid, a stock/broth item, a condiment, an additive, or unknown.
+- Do not confuse cooking instructions with ingredient identity.
+- Words like boiling, hot, cold, warm, iced, tap, filtered, and fresh may describe temperature or preparation, not calories.
+
+STAGE 2 — Decide macro relevance:
+- Set macroRelevant = false for zero-calorie cooking liquids, plain water, ice, salt, pepper, herbs, spices, and seasonings that are normally used in negligible amounts.
+- Set macroRelevant = true for calorie-containing foods and liquids, including oils, butter, dairy, cheese, cream cheese, meat, fish, eggs, pasta, rice, bread, flour, sugar, fruit, vegetables, nuts, seeds, sauces, milk, cream, yoghurt, stock cubes, and condiments.
+- If unsure whether it has calories, set macroRelevant = true and category = "unknown".
+
+STAGE 3 — Estimate per 100g macros:
+- If macroRelevant is false, calories, protein, carbs, and fat must all be 0.
+- If macroRelevant is true, estimate typical raw/plain nutrition per 100g.
+- Do not use brand-specific values unless the ingredient clearly specifies a brand.
+- Do not estimate based on the recipe quantity. Values must be per 100g only.
+
+STAGE 4 — Sanity check:
+- Plain water, boiling water, hot water, cold water, warm water, and ice must be 0 calories per 100g.
+- Salt, pepper, dried herbs, and spices used as seasonings should be 0 calories per 100g for this recipe calculator.
+- Oil and pure fats may be around 884 calories and 100g fat per 100g.
+- Most foods cannot exceed 950 calories per 100g.
+- Protein, carbs, and fat cannot exceed 100g per 100g.
+- If the ingredient is a zero-calorie liquid but your calories are not 0, correct it before returning.
+- If calories are implausibly high for the category, lower confidence or set category to "unknown".
+
+Use exactly one category:
+- "primary_food"
+- "vegetable"
+- "fruit"
+- "herb_or_spice"
+- "seasoning"
+- "zero_calorie_liquid"
+- "caloric_liquid"
+- "stock_or_broth"
+- "condiment"
+- "leavening_or_additive"
+- "unknown"
+
+Return this exact JSON shape:
+{
+  "macroRelevant": boolean,
+  "category": "primary_food" | "vegetable" | "fruit" | "herb_or_spice" | "seasoning" | "zero_calorie_liquid" | "caloric_liquid" | "stock_or_broth" | "condiment" | "leavening_or_additive" | "unknown",
+  "calories": number,
+  "protein": number,
+  "carbs": number,
+  "fat": number,
+  "confidence": "high" | "medium" | "low",
+  "notes": string
+}
+          `.trim(),
+        },
+        {
+          role: "user",
+          content: `
+Estimate nutrition macros per 100g for this recipe ingredient:
+
+"${ingredientName}"
+
+Important:
+- Return per 100g values only.
+- Do not use the recipe quantity.
+- If this is plain water, boiling water, hot water, cold water, warm water, or ice, return macroRelevant false and all macros 0.
+- If this is salt, pepper, an herb, a spice, or negligible seasoning, return macroRelevant false and all macros 0.
+- If this is oil, butter, cheese, cream cheese, meat, pasta, rice, vegetables, fruit, dairy, sauce, stock cube, or condiment, return macroRelevant true with reasonable per-100g macros.
+- Perform the sanity check before returning JSON.
+          `.trim(),
+        },
+      ],
+    }),
+  })
+
+  if (!response.ok) {
+    const errorText = await response.text()
+
+    console.error("OpenRouter macro estimate failed:", {
+      ingredientName,
+      status: response.status,
+      errorText,
+    })
+
+    return null
+  }
+
+  const data = await response.json()
+  const text = data?.choices?.[0]?.message?.content?.trim()
+
+  if (!text) {
+    console.error("OpenRouter returned empty macro estimate:", {
+      ingredientName,
+      data,
+    })
+
+    return null
+  }
+
+  try {
+    const parsed = extractJsonObject(text)
+
+    const allowedCategories = new Set<MacroCategory>([
+      "primary_food",
+      "vegetable",
+      "fruit",
+      "herb_or_spice",
+      "seasoning",
+      "zero_calorie_liquid",
+      "caloric_liquid",
+      "stock_or_broth",
+      "condiment",
+      "leavening_or_additive",
+      "unknown",
+    ])
+
+    const category: MacroCategory = allowedCategories.has(parsed.category)
+      ? parsed.category
+      : "unknown"
+
+    const estimate: AiMacroEstimate = {
+      macroRelevant:
+        typeof parsed.macroRelevant === "boolean"
+          ? parsed.macroRelevant
+          : true,
+      category,
+      calories: Number(parsed.calories),
+      protein: Number(parsed.protein),
+      carbs: Number(parsed.carbs),
+      fat: Number(parsed.fat),
+      confidence:
+        parsed.confidence === "high" ||
+        parsed.confidence === "medium" ||
+        parsed.confidence === "low"
+          ? parsed.confidence
+          : "low",
+      notes: String(parsed.notes || ""),
+    }
+
+    if (
+      Number.isNaN(estimate.calories) ||
+      Number.isNaN(estimate.protein) ||
+      Number.isNaN(estimate.carbs) ||
+      Number.isNaN(estimate.fat)
+    ) {
+      console.error("AI macro estimate contained invalid numbers:", {
+        ingredientName,
+        parsed,
+      })
+
+      return null
+    }
+
+    if (estimate.macroRelevant === false) {
+      return {
+        macroRelevant: false,
+        category: estimate.category,
+        calories: 0,
+        protein: 0,
+        carbs: 0,
+        fat: 0,
+        confidence: estimate.confidence,
+        notes: estimate.notes || "Not macro relevant for recipe calculation.",
+      }
+    }
+
+    const macroSet: MacroSet = {
+      calories: estimate.calories,
+      protein: estimate.protein,
+      carbs: estimate.carbs,
+      fat: estimate.fat,
+    }
+
+    if (!isValidMacroSet(macroSet)) {
+      console.error("AI macro estimate failed sanity check:", {
+        ingredientName,
+        estimate,
+      })
+
+      return null
+    }
+
+    return {
+      macroRelevant: true,
+      category: estimate.category,
+      calories: roundCalories(estimate.calories),
+      protein: roundMacro(estimate.protein),
+      carbs: roundMacro(estimate.carbs),
+      fat: roundMacro(estimate.fat),
+      confidence: estimate.confidence,
+      notes: estimate.notes,
+    }
+  } catch (error) {
+    console.error("Failed to parse OpenRouter macro estimate:", {
+      ingredientName,
+      text,
+      error,
+    })
+
+    return null
+  }
 }
 
 export async function calculateMacros(ingredients: InputIngredient[]) {
@@ -1006,6 +1240,51 @@ export async function calculateMacros(ingredients: InputIngredient[]) {
       originalName
     )
 
+    /**
+     * Absolute water safety override.
+     *
+     * This must run before:
+     * - gram null handling
+     * - cache lookup
+     * - manual macro lookup
+     * - AI lookup
+     *
+     * Water should never enter the AI/cache path because a bad AI/cache row can
+     * make it look like oil at 884 calories / 100g.
+     */
+    if (isZeroCalorieWaterIngredient(originalName) || normalized === "water") {
+      updatedIngredients.push({
+        name: originalName,
+        quantity: ingredient.quantity,
+        unit: ingredient.unit,
+
+        normalized_name: "water",
+        grams_normalized:
+          gramResult.grams === null ? null : roundMacro(gramResult.grams),
+
+        calories: 0,
+        protein: 0,
+        carbs: 0,
+        fat: 0,
+
+        calories_per_100g: 0,
+        protein_per_100g: 0,
+        carbs_per_100g: 0,
+        fat_per_100g: 0,
+
+        normalization_status:
+          gramResult.grams === null
+            ? "needs_review"
+            : gramResult.normalization_status,
+        nutrition_status: "manual_override",
+
+        fdc_id: null,
+        usda_description: "Hardcoded zero-calorie water override",
+      })
+
+      continue
+    }
+
     if (gramResult.grams === null) {
       updatedIngredients.push({
         name: originalName,
@@ -1027,14 +1306,14 @@ export async function calculateMacros(ingredients: InputIngredient[]) {
     }
 
     let macrosPer100g: MacroSet | null = null
-    let nutritionStatus: NutritionStatus = "matched"
+    let nutritionStatus: NutritionStatus = "ai_estimated"
     let fdcId: number | null = null
-    let usdaDescription: string | null = null
+    let nutritionDescription: string | null = null
 
     if (MANUAL_MACROS_PER_100G[normalized]) {
       macrosPer100g = MANUAL_MACROS_PER_100G[normalized]
       nutritionStatus = "manual_override"
-      usdaDescription = "Manual macro override"
+      nutritionDescription = "Manual macro override"
     } else {
       const { data: cached } = await supabase
         .from("ingredient_nutrition_cache")
@@ -1042,21 +1321,44 @@ export async function calculateMacros(ingredients: InputIngredient[]) {
         .eq("name", normalized)
         .maybeSingle()
 
-      if (cached) {
-        macrosPer100g = {
+      /**
+       * Only trust cache rows created by the current AI estimator.
+       * Old cache rows, null source rows, and invalid rows are ignored
+       * and replaced with a fresh OpenRouter/DeepSeek estimate.
+       */
+      if (cached && cached.source === "AI_ESTIMATE") {
+        const cachedMacros: MacroSet = {
           calories: Number(cached.calories_per_100g || 0),
           protein: Number(cached.protein_per_100g || 0),
           carbs: Number(cached.carbs_per_100g || 0),
           fat: Number(cached.fat_per_100g || 0),
         }
 
-        nutritionStatus = "cached"
-        fdcId = cached.fdc_id || null
-        usdaDescription = cached.usda_description || null
-      } else {
-        const food = await lookupUSDA(normalized)
+        if (isValidMacroSet(cachedMacros)) {
+          macrosPer100g = cachedMacros
+          nutritionStatus = "cached"
+          fdcId = null
+          nutritionDescription =
+            cached.usda_description || "Cached DeepSeek/OpenRouter AI estimate"
+        } else {
+          console.log("Ignoring invalid cached AI nutrition row:", {
+            ingredient: normalized,
+            cachedMacros,
+          })
+        }
+      }
 
-        if (!food) {
+      if (!macrosPer100g) {
+        if (cached) {
+          console.log("Replacing old or invalid nutrition cache row:", {
+            ingredient: normalized,
+            oldSource: cached.source || null,
+          })
+        }
+
+        const aiEstimate = await estimateMacrosWithAI(normalized)
+
+        if (!aiEstimate) {
           updatedIngredients.push({
             name: originalName,
             quantity: ingredient.quantity,
@@ -1076,28 +1378,56 @@ export async function calculateMacros(ingredients: InputIngredient[]) {
           continue
         }
 
-        macrosPer100g = extractMacrosPer100g(food)
-        fdcId = food.fdcId || null
-        usdaDescription = food.description || null
+        macrosPer100g = {
+          calories: aiEstimate.calories,
+          protein: aiEstimate.protein,
+          carbs: aiEstimate.carbs,
+          fat: aiEstimate.fat,
+        }
 
-        await supabase.from("ingredient_nutrition_cache").upsert(
-          [
+        nutritionStatus = "ai_estimated"
+        fdcId = null
+        nutritionDescription = `DeepSeek/OpenRouter AI estimate. Category: ${aiEstimate.category}. Macro relevant: ${aiEstimate.macroRelevant}. Confidence: ${aiEstimate.confidence}. ${aiEstimate.notes}`
+
+        const { error: cacheUpsertError } = await supabase
+          .from("ingredient_nutrition_cache")
+          .upsert(
+            [
+              {
+                name: normalized,
+                calories_per_100g: macrosPer100g.calories,
+                protein_per_100g: macrosPer100g.protein,
+                carbs_per_100g: macrosPer100g.carbs,
+                fat_per_100g: macrosPer100g.fat,
+                source: "AI_ESTIMATE",
+                fdc_id: null,
+                usda_description: nutritionDescription,
+              },
+            ],
             {
-              name: normalized,
-              calories_per_100g: macrosPer100g.calories,
-              protein_per_100g: macrosPer100g.protein,
-              carbs_per_100g: macrosPer100g.carbs,
-              fat_per_100g: macrosPer100g.fat,
-              source: "USDA",
-              fdc_id: fdcId,
-              usda_description: usdaDescription,
-            },
-          ],
-          {
-            onConflict: "name",
-          }
-        )
+              onConflict: "name",
+            }
+          )
+
+        if (cacheUpsertError) {
+          console.error("Failed to save AI nutrition estimate to cache:", {
+            ingredient: normalized,
+            error: cacheUpsertError,
+          })
+        }
       }
+    }
+
+    /**
+     * Final safety override.
+     * This should be unreachable for water because of the earlier continue,
+     * but it protects against future refactors.
+     */
+    if (normalized === "water" || isZeroCalorieWaterIngredient(originalName)) {
+      macrosPer100g = ZERO_MACROS
+      nutritionStatus = "manual_override"
+      fdcId = null
+      nutritionDescription = "Final zero-calorie water safety override"
     }
 
     const multiplier = gramResult.grams / 100
@@ -1139,7 +1469,7 @@ export async function calculateMacros(ingredients: InputIngredient[]) {
       nutrition_status: nutritionStatus,
 
       fdc_id: fdcId,
-      usda_description: usdaDescription,
+      usda_description: nutritionDescription,
     })
   }
 

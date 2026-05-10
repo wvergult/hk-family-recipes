@@ -33,6 +33,12 @@ interface EditableIngredient {
   unit: string
 }
 
+interface ParsedIngredient {
+  name: string
+  quantity: number | string | null
+  unit: string | null
+}
+
 interface RecalculatedIngredient {
   name: string
   quantity: number | string | null
@@ -196,22 +202,19 @@ function formatQuantity(quantity: number) {
   return quantity.toFixed(2).replace(/\.00$/, "").replace(/0$/, "")
 }
 
-function roundCalories(value: number) {
-  return Math.round(value)
-}
+function normalizeParsedQuantity(quantity: number | string | null) {
+  if (quantity === null || quantity === undefined || quantity === "") {
+    return ""
+  }
 
-function roundMacro(value: number) {
-  return Number(value.toFixed(1))
-}
+  const numberQuantity =
+    typeof quantity === "number" ? quantity : Number(String(quantity).trim())
 
-function valuesAreClose(
-  currentValue: number | null | undefined,
-  nextValue: number,
-  tolerance = 0.05
-) {
-  if (currentValue === null || currentValue === undefined) return false
+  if (Number.isNaN(numberQuantity)) {
+    return ""
+  }
 
-  return Math.abs(Number(currentValue) - nextValue) <= tolerance
+  return String(numberQuantity)
 }
 
 export default function RecipePage() {
@@ -233,13 +236,9 @@ export default function RecipePage() {
   const [savedRecipeMacros, setSavedRecipeMacros] =
     useState<SavedRecipeMacros | null>(null)
 
-  // This controls how many servings the saved recipe is divided into
   const [selectedServings, setSelectedServings] = useState(1)
-
-  // This controls how many portions you actually want to cook
   const [targetServings, setTargetServings] = useState(1)
 
-  // Edit mode state
   const [isEditing, setIsEditing] = useState(false)
   const [editableIngredients, setEditableIngredients] = useState<
     EditableIngredient[]
@@ -249,6 +248,9 @@ export default function RecipePage() {
   const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   const [statusMessage, setStatusMessage] = useState("")
+
+  const [reparseText, setReparseText] = useState("")
+  const [reparsing, setReparsing] = useState(false)
 
   const fetchData = async () => {
     const { data: recipe } = await supabase
@@ -319,6 +321,7 @@ export default function RecipePage() {
     setImagePreviewUrl(imageUrl)
     setNewImageFile(null)
     setStatusMessage("")
+    setReparseText("")
     setIsEditing(true)
   }
 
@@ -328,6 +331,7 @@ export default function RecipePage() {
     setImagePreviewUrl(null)
     setNewImageFile(null)
     setStatusMessage("")
+    setReparseText("")
     setIsEditing(false)
   }
 
@@ -359,6 +363,74 @@ export default function RecipePage() {
 
   const removeIngredient = (index: number) => {
     setEditableIngredients(editableIngredients.filter((_, i) => i !== index))
+  }
+
+  const reparseIngredients = async () => {
+    const textToParse = reparseText.trim()
+
+    if (!textToParse) {
+      setStatusMessage("Paste recipe text before reparsing ingredients.")
+      return
+    }
+
+    setReparsing(true)
+    setStatusMessage("Parsing ingredients from pasted recipe text...")
+
+    try {
+      const response = await fetch("/api/parse-recipe-ingredients", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          title,
+          text: textToParse,
+        }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null)
+        throw new Error(errorData?.error || "Could not parse ingredients.")
+      }
+
+      const data = (await response.json()) as {
+        ingredients?: ParsedIngredient[]
+        base_servings?: number | null
+      }
+
+      const parsedIngredients = data.ingredients || []
+
+      if (parsedIngredients.length === 0) {
+        throw new Error("No ingredients were found in the pasted text.")
+      }
+
+      setEditableIngredients(
+        parsedIngredients
+          .filter((ing) => ing.name?.trim())
+          .map((ing) => ({
+            name: ing.name.trim(),
+            quantity: normalizeParsedQuantity(ing.quantity),
+            unit: ing.unit?.trim() || "",
+          }))
+      )
+
+      if (data.base_servings && data.base_servings > 0) {
+        setEditableBaseServings(data.base_servings)
+      }
+
+      setStatusMessage(
+        `Parsed ${parsedIngredients.length} ingredient${
+          parsedIngredients.length === 1 ? "" : "s"
+        }. Review them, then click Save Changes.`
+      )
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Something went wrong."
+
+      setStatusMessage(`Parser error: ${message}`)
+    } finally {
+      setReparsing(false)
+    }
   }
 
   const handleImageFile = (file: File) => {
@@ -580,14 +652,13 @@ export default function RecipePage() {
       }
 
       const recalculatedRecipe = (await response.json()) as RecalculatedRecipe
+      console.log("Recalculated recipe response:", recalculatedRecipe)
 
-      const { error: deleteError } = await supabase
-        .from("ingredients")
-        .delete()
-        .eq("recipe_id", recipeId)
-
-      if (deleteError) {
-        throw new Error(deleteError.message)
+      if (
+        !recalculatedRecipe.ingredients ||
+        recalculatedRecipe.ingredients.length === 0
+      ) {
+        throw new Error("Recalculation returned no ingredients.")
       }
 
       const ingredientsToInsert = recalculatedRecipe.ingredients.map(
@@ -602,6 +673,26 @@ export default function RecipePage() {
           fat: ing.fat || 0,
         })
       )
+
+      /**
+       * Important safety change:
+       * Build and validate the insert payload BEFORE deleting existing rows.
+       * This will not fully replace a DB transaction, but it prevents the
+       * exact failure mode where rows are deleted before we know the payload
+       * can even be constructed.
+       */
+      if (ingredientsToInsert.length === 0) {
+        throw new Error("No valid ingredients to save.")
+      }
+
+      const { error: deleteError } = await supabase
+        .from("ingredients")
+        .delete()
+        .eq("recipe_id", recipeId)
+
+      if (deleteError) {
+        throw new Error(deleteError.message)
+      }
 
       const { data: insertedIngredients, error: insertError } = await supabase
         .from("ingredients")
@@ -642,9 +733,12 @@ export default function RecipePage() {
       setTargetServings(editableBaseServings)
       setSavedRecipeMacros(nextSavedRecipeMacros)
       setIngredients(insertedIngredients || [])
+      console.log("Inserted ingredients:", insertedIngredients)
+      console.log("Saved recipe macros:", nextSavedRecipeMacros)
       setEditableIngredients([])
       setNewImageFile(null)
       setImagePreviewUrl(null)
+      setReparseText("")
       setIsEditing(false)
       setStatusMessage("Recipe updated.")
 
@@ -659,129 +753,77 @@ export default function RecipePage() {
     }
   }
 
-  const originalTotalCalories = ingredients.reduce(
-    (sum, ing) => sum + ing.calories,
+  const ingredientTotalCalories = ingredients.reduce(
+    (sum, ing) => sum + Number(ing.calories || 0),
     0
   )
 
-  const originalTotalProtein = ingredients.reduce(
-    (sum, ing) => sum + ing.protein,
+  const ingredientTotalProtein = ingredients.reduce(
+    (sum, ing) => sum + Number(ing.protein || 0),
     0
   )
 
-  const originalTotalCarbs = ingredients.reduce(
-    (sum, ing) => sum + ing.carbs,
+  const ingredientTotalCarbs = ingredients.reduce(
+    (sum, ing) => sum + Number(ing.carbs || 0),
     0
   )
 
-  const originalTotalFat = ingredients.reduce(
-    (sum, ing) => sum + ing.fat,
+  const ingredientTotalFat = ingredients.reduce(
+    (sum, ing) => sum + Number(ing.fat || 0),
     0
   )
 
-  const syncedCaloriesPerServing = roundCalories(
-    originalTotalCalories / baseServings
-  )
-  const syncedProteinPerServing = roundMacro(originalTotalProtein / baseServings)
-  const syncedCarbsPerServing = roundMacro(originalTotalCarbs / baseServings)
-  const syncedFatPerServing = roundMacro(originalTotalFat / baseServings)
+  const originalTotalCalories =
+    savedRecipeMacros?.total_calories ?? ingredientTotalCalories
 
-  const syncedTotalCalories = roundCalories(originalTotalCalories)
-  const syncedTotalProtein = roundMacro(originalTotalProtein)
-  const syncedTotalCarbs = roundMacro(originalTotalCarbs)
-  const syncedTotalFat = roundMacro(originalTotalFat)
+  const originalTotalProtein =
+    savedRecipeMacros?.total_protein ?? ingredientTotalProtein
 
-  useEffect(() => {
-    const syncRecipeCardMacros = async () => {
-      if (!recipeId || !savedRecipeMacros || ingredients.length === 0) return
-      if (!baseServings || baseServings < 1) return
-      if (isEditing || saving) return
+  const originalTotalCarbs =
+    savedRecipeMacros?.total_carbs ?? ingredientTotalCarbs
 
-      const nextMacros = {
-        total_calories: syncedTotalCalories,
-        total_protein: syncedTotalProtein,
-        total_carbs: syncedTotalCarbs,
-        total_fat: syncedTotalFat,
-        calories_per_serving: syncedCaloriesPerServing,
-        protein_per_serving: syncedProteinPerServing,
-        carbs_per_serving: syncedCarbsPerServing,
-        fat_per_serving: syncedFatPerServing,
-      }
+  const originalTotalFat = savedRecipeMacros?.total_fat ?? ingredientTotalFat
 
-      const alreadySynced =
-        valuesAreClose(savedRecipeMacros.total_calories, nextMacros.total_calories) &&
-        valuesAreClose(savedRecipeMacros.total_protein, nextMacros.total_protein) &&
-        valuesAreClose(savedRecipeMacros.total_carbs, nextMacros.total_carbs) &&
-        valuesAreClose(savedRecipeMacros.total_fat, nextMacros.total_fat) &&
-        valuesAreClose(
-          savedRecipeMacros.calories_per_serving,
-          nextMacros.calories_per_serving
-        ) &&
-        valuesAreClose(
-          savedRecipeMacros.protein_per_serving,
-          nextMacros.protein_per_serving
-        ) &&
-        valuesAreClose(
-          savedRecipeMacros.carbs_per_serving,
-          nextMacros.carbs_per_serving
-        ) &&
-        valuesAreClose(
-          savedRecipeMacros.fat_per_serving,
-          nextMacros.fat_per_serving
-        )
+  const safeBaseServings = baseServings > 0 ? baseServings : 1
+  const safeTargetServings = targetServings > 0 ? targetServings : 1
+  const safeSelectedServings = selectedServings > 0 ? selectedServings : 1
 
-      if (alreadySynced) return
-
-      const { error } = await supabase
-        .from("recipes")
-        .update(nextMacros)
-        .eq("id", recipeId)
-
-      if (error) {
-        console.error("Failed to sync recipe card macros:", error)
-        return
-      }
-
-      setSavedRecipeMacros(nextMacros)
-      console.log("Recipe card macros synced:", nextMacros)
-    }
-
-    syncRecipeCardMacros()
-  }, [
-    recipeId,
-    savedRecipeMacros,
-    ingredients.length,
-    baseServings,
-    isEditing,
-    saving,
-    syncedTotalCalories,
-    syncedTotalProtein,
-    syncedTotalCarbs,
-    syncedTotalFat,
-    syncedCaloriesPerServing,
-    syncedProteinPerServing,
-    syncedCarbsPerServing,
-    syncedFatPerServing,
-  ])
-
-  const batchMultiplier = targetServings / baseServings
+  const batchMultiplier = safeTargetServings / safeBaseServings
 
   const recipeTotalCalories = originalTotalCalories * batchMultiplier
   const recipeTotalProtein = originalTotalProtein * batchMultiplier
   const recipeTotalCarbs = originalTotalCarbs * batchMultiplier
   const recipeTotalFat = originalTotalFat * batchMultiplier
 
-  const perServingCalories = recipeTotalCalories / targetServings
-  const perServingProtein = recipeTotalProtein / targetServings
-  const perServingCarbs = recipeTotalCarbs / targetServings
-  const perServingFat = recipeTotalFat / targetServings
+  const perServingCalories = recipeTotalCalories / safeTargetServings
+  const perServingProtein = recipeTotalProtein / safeTargetServings
+  const perServingCarbs = recipeTotalCarbs / safeTargetServings
+  const perServingFat = recipeTotalFat / safeTargetServings
 
-  const dividedServingCalories = recipeTotalCalories / selectedServings
-  const dividedServingProtein = recipeTotalProtein / selectedServings
-  const dividedServingCarbs = recipeTotalCarbs / selectedServings
-  const dividedServingFat = recipeTotalFat / selectedServings
+  const dividedServingCalories = recipeTotalCalories / safeSelectedServings
+  const dividedServingProtein = recipeTotalProtein / safeSelectedServings
+  const dividedServingCarbs = recipeTotalCarbs / safeSelectedServings
+  const dividedServingFat = recipeTotalFat / safeSelectedServings
 
   const stepList = steps ? steps.split("\n").filter(Boolean) : []
+
+  console.log("Displayed macro totals:", {
+    savedRecipeMacros,
+    originalTotalCalories,
+    originalTotalProtein,
+    originalTotalCarbs,
+    originalTotalFat,
+    targetServings,
+    baseServings,
+    recipeTotalCalories,
+    recipeTotalProtein,
+    recipeTotalCarbs,
+    recipeTotalFat,
+    perServingCalories,
+    perServingProtein,
+    perServingCarbs,
+    perServingFat,
+  })
 
   return (
     <main
@@ -846,7 +888,7 @@ export default function RecipePage() {
               <div className="flex gap-3">
                 <button
                   onClick={cancelEditing}
-                  disabled={saving}
+                  disabled={saving || reparsing}
                   className="bg-neutral-200 text-black rounded-full px-5 py-2 text-sm hover:opacity-80 transition disabled:opacity-50"
                 >
                   Cancel
@@ -854,7 +896,7 @@ export default function RecipePage() {
 
                 <button
                   onClick={saveChanges}
-                  disabled={saving}
+                  disabled={saving || reparsing}
                   className="bg-black text-white rounded-full px-5 py-2 text-sm hover:opacity-80 transition disabled:opacity-50"
                 >
                   {saving ? "Saving..." : "Save Changes"}
@@ -882,7 +924,7 @@ export default function RecipePage() {
             )}
 
             {statusMessage && (
-              <p className="text-sm text-neutral-500 mt-4">
+              <p className="text-sm text-neutral-500 mt-4 whitespace-pre-line">
                 {statusMessage}
               </p>
             )}
@@ -1068,7 +1110,7 @@ export default function RecipePage() {
             {isEditing && (
               <button
                 onClick={addIngredient}
-                disabled={saving}
+                disabled={saving || reparsing}
                 className="bg-neutral-100 text-black rounded-full px-5 py-2 text-sm hover:bg-neutral-200 transition disabled:opacity-50"
               >
                 + Add Ingredient
@@ -1182,7 +1224,7 @@ export default function RecipePage() {
 
                       <button
                         onClick={() => removeIngredient(index)}
-                        disabled={saving}
+                        disabled={saving || reparsing}
                         className="md:col-span-1 bg-red-50 text-red-600 rounded-xl px-4 py-3 text-sm hover:bg-red-100 transition disabled:opacity-50"
                       >
                         Remove
@@ -1248,6 +1290,43 @@ export default function RecipePage() {
             >
               {sourceUrl}
             </a>
+          </div>
+        )}
+
+        {/* Re-parse Ingredients */}
+        {isEditing && (
+          <div className="bg-white rounded-3xl p-8 shadow-sm space-y-5 border border-amber-200">
+            <div>
+              <h2 className="text-2xl font-semibold">Re-parse Ingredients</h2>
+
+              <p className="text-sm text-neutral-500 mt-2">
+                Paste the original recipe text here. The parser will try to
+                extract only the ingredients, then replace the editable
+                ingredient list above. This does not save automatically.
+              </p>
+            </div>
+
+            <textarea
+              value={reparseText}
+              onChange={(e) => setReparseText(e.target.value)}
+              disabled={saving || reparsing}
+              placeholder="Paste the original recipe text, recipe card, copied website content, or video description here..."
+              className="w-full min-h-64 border border-neutral-200 rounded-2xl px-4 py-3 text-sm leading-relaxed disabled:opacity-50"
+            />
+
+            <div className="flex flex-col md:flex-row md:items-center gap-3">
+              <button
+                onClick={reparseIngredients}
+                disabled={saving || reparsing || !reparseText.trim()}
+                className="bg-amber-500 text-white rounded-full px-5 py-2 text-sm hover:opacity-80 transition disabled:opacity-50"
+              >
+                {reparsing ? "Parsing..." : "Re-parse Ingredients"}
+              </button>
+
+              <p className="text-sm text-neutral-500">
+                Review the parsed ingredients before clicking Save Changes.
+              </p>
+            </div>
           </div>
         )}
       </div>
